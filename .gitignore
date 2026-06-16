@@ -1,0 +1,13 @@
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.venv/
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# local backups
+app.old.py
+*.old.py

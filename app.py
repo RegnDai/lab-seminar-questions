@@ -1,4 +1,5 @@
 import calendar
+import hashlib
 import hmac
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -32,6 +33,36 @@ QUESTION_TAGS = [
     "其他",
 ]
 
+REACTION_TYPES = [
+    "🧠批判性思维",
+    "💡还有这种思路",
+    "🤝英雄所见略同",
+    "🔍严谨审视",
+    "✨很有启发",
+]
+
+AWARD_TITLES = {
+    "🧠批判性思维": "批判性思考者",
+    "💡还有这种思路": "创想者",
+    "🤝英雄所见略同": "大众嘴替",
+    "🔍严谨审视": "严谨者",
+    "✨很有启发": "启迪者",
+}
+
+REACTION_ALIASES = {
+    "🧠 批判性思维": "🧠批判性思维",
+    "💡 还有这种思路": "💡还有这种思路",
+    "🤝 英雄所见略同": "🤝英雄所见略同",
+    "🔍 严谨审视": "🔍严谨审视",
+    "✨ 很有启发": "✨很有启发",
+    "批判性思维": "🧠批判性思维",
+    "还有这种思路": "💡还有这种思路",
+    "英雄所见略同": "🤝英雄所见略同",
+    "严谨审视": "🔍严谨审视",
+    "很有启发": "✨很有启发",
+    "有启发": "✨很有启发",
+}
+
 
 @st.cache_resource
 def get_supabase():
@@ -62,6 +93,20 @@ def clean_text(value) -> str:
 
     if value.lower() in ["nan", "none", "nat"]:
         return ""
+
+    return value
+
+
+def normalize_reaction_type(value: str) -> str:
+    value = clean_text(value)
+
+    if not value:
+        return "✨很有启发"
+
+    value = REACTION_ALIASES.get(value, value)
+
+    if value not in REACTION_TYPES:
+        return "✨很有启发"
 
     return value
 
@@ -215,9 +260,13 @@ def load_votes() -> pd.DataFrame:
     df = pd.DataFrame(response.data or [])
 
     if df.empty:
-        return pd.DataFrame(columns=["id", "question_id", "voter_name", "created_at"])
+        return pd.DataFrame(columns=["id", "question_id", "voter_name", "reaction_type", "created_at"])
+
+    if "reaction_type" not in df.columns:
+        df["reaction_type"] = "有启发"
 
     df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+    df["reaction_type"] = df["reaction_type"].fillna("有启发").astype(str)
 
     return df
 
@@ -298,12 +347,13 @@ def create_question(
     clear_caches()
 
 
-def vote_question(question_id: int, voter_name: str) -> bool:
+def vote_question(question_id: int, voter_name: str, reaction_type: str) -> bool:
     try:
         supabase.table("seminar_question_votes").insert(
             {
                 "question_id": int(question_id),
                 "voter_name": voter_name,
+                "reaction_type": reaction_type,
             }
         ).execute()
         clear_caches()
@@ -451,7 +501,13 @@ def render_login():
     st.stop()
 
 
-def render_question(question, vote_count: int, has_voted: bool, user_name: str):
+def render_question(
+    question,
+    votes_for_question: pd.DataFrame,
+    has_reacted: bool,
+    user_name: str,
+    speaker_name: str,
+):
     question_id = int(question["id"])
 
     asker = clean_text(question.get("asker_name"))
@@ -460,6 +516,9 @@ def render_question(question, vote_count: int, has_voted: bool, user_name: str):
     question_text = clean_text(question.get("question_text"))
     answer_text = clean_text(question.get("answer_text"))
     answer_by = clean_text(question.get("answer_by"))
+
+    is_own_question = clean_text(user_name) == clean_text(asker)
+    is_speaker = clean_text(user_name) == clean_text(speaker_name)
 
     flags = []
 
@@ -470,39 +529,88 @@ def render_question(question, vote_count: int, has_voted: bool, user_name: str):
         flags.append(tag)
 
     if bool(question.get("is_featured")):
-        flags.append("精选")
-
-    flag_text = " · ".join(flags)
+        flags.append("🌟 主讲人觉得很赞")
 
     st.markdown(f"**{asker}**：{question_text}")
 
-    if flag_text:
-        st.caption(flag_text)
+    if flags:
+        st.caption(" · ".join(flags))
+
+    def _normalize_reaction(value: str) -> str:
+        value = clean_text(value)
+
+        aliases = {
+            "🧠 批判性思维": "🧠批判性思维",
+            "💡 还有这种思路": "💡还有这种思路",
+            "🤝 英雄所见略同": "🤝英雄所见略同",
+            "🔍 严谨审视": "🔍严谨审视",
+            "✨ 很有启发": "✨很有启发",
+            "批判性思维": "🧠批判性思维",
+            "还有这种思路": "💡还有这种思路",
+            "英雄所见略同": "🤝英雄所见略同",
+            "严谨审视": "🔍严谨审视",
+            "很有启发": "✨很有启发",
+            "有启发": "✨很有启发",
+        }
+
+        value = aliases.get(value, value)
+
+        if value not in REACTION_TYPES:
+            return "✨很有启发"
+
+        return value
+
+    reaction_counts = {}
+
+    if not votes_for_question.empty:
+        tmp = votes_for_question.copy()
+        tmp["reaction_type"] = tmp["reaction_type"].apply(_normalize_reaction)
+        reaction_counts = tmp["reaction_type"].value_counts().to_dict()
 
     if answer_text:
         st.markdown(f"> **{answer_by or '回复'}：** {answer_text}")
 
-    c1, c2, c3 = st.columns([1, 1, 5])
+    reaction_cols = st.columns([1.45, 1.55, 1.65, 1.35, 1.35, 1.15])
 
-    with c1:
-        if st.button(
-            f"👍 {vote_count}",
-            key=f"vote_{question_id}_{user_name}",
-            disabled=has_voted,
-        ):
-            ok = vote_question(question_id, user_name)
-            if not ok:
-                st.info("你已经点过赞了。")
-            st.rerun()
+    for idx, reaction_type in enumerate(REACTION_TYPES):
+        count = int(reaction_counts.get(reaction_type, 0))
 
-    with c2:
-        featured_label = "取消精选" if bool(question.get("is_featured")) else "精选"
-        if st.button(featured_label, key=f"featured_{question_id}"):
-            update_question_flags(
-                question_id,
-                is_featured=not bool(question.get("is_featured")),
+        with reaction_cols[idx]:
+            if st.button(
+                f"{reaction_type} {count}",
+                key=f"reaction_{question_id}_{idx}_{user_name}",
+                disabled=has_reacted or is_own_question,
+            ):
+                ok = vote_question(question_id, user_name, reaction_type)
+
+                if not ok:
+                    st.info("你已经给这条问题标注过反应。")
+
+                st.rerun()
+
+    with reaction_cols[5]:
+        can_speaker_endorse = is_speaker and not is_own_question
+
+        if can_speaker_endorse:
+            endorse_label = "🌟 主讲已赞" if bool(question.get("is_featured")) else "🌟 主讲赞"
+
+            if st.button(endorse_label, key=f"speaker_endorse_{question_id}"):
+                update_question_flags(
+                    question_id,
+                    is_featured=not bool(question.get("is_featured")),
+                )
+                st.rerun()
+        else:
+            st.button(
+                "🌟 主讲已赞" if bool(question.get("is_featured")) else "🌟 主讲赞",
+                key=f"speaker_endorse_disabled_{question_id}",
+                disabled=True,
             )
-            st.rerun()
+
+    if is_own_question:
+        st.caption("不能评价自己的问题。")
+    elif has_reacted:
+        st.caption("你已经给这条问题标注过一个反应。")
 
     with st.expander("回复"):
         with st.form(f"answer_form_{question_id}"):
@@ -522,6 +630,7 @@ def render_question(question, vote_count: int, has_voted: bool, user_name: str):
                 st.rerun()
 
     st.divider()
+
 
 
 def render_talk_module(meeting, talk, questions, votes, user_name: str):
@@ -651,13 +760,7 @@ def render_talk_module(meeting, talk, questions, votes, user_name: str):
         st.info("还没有问题。")
         return
 
-    vote_counts = (
-        votes.groupby("question_id")["id"].count().to_dict()
-        if not votes.empty
-        else {}
-    )
-
-    user_voted = set(
+    user_reacted = set(
         votes[votes["voter_name"].astype(str) == str(user_name)]["question_id"].astype(int).tolist()
         if not votes.empty
         else []
@@ -670,11 +773,19 @@ def render_talk_module(meeting, talk, questions, votes, user_name: str):
 
     for _, question in talk_questions.iterrows():
         qid = int(question["id"])
+
+        votes_for_question = (
+            votes[votes["question_id"].astype(int) == qid].copy()
+            if not votes.empty
+            else pd.DataFrame(columns=["reaction_type"])
+        )
+
         render_question(
             question=question,
-            vote_count=int(vote_counts.get(qid, 0)),
-            has_voted=qid in user_voted,
+            votes_for_question=votes_for_question,
+            has_reacted=qid in user_reacted,
             user_name=user_name,
+            speaker_name=speaker,
         )
 
 
@@ -779,6 +890,327 @@ def render_live_page(user_name: str):
             votes=votes,
             user_name=user_name,
         )
+
+
+
+def clear_poll_caches():
+    try:
+        load_polls.clear()
+        load_poll_options.clear()
+        load_poll_votes.clear()
+    except Exception:
+        pass
+
+
+@st.cache_data(ttl=5)
+def load_polls() -> pd.DataFrame:
+    response = (
+        supabase.table("seminar_polls")
+        .select("*")
+        .order("created_at", desc=True)
+        .limit(500)
+        .execute()
+    )
+
+    df = pd.DataFrame(response.data or [])
+
+    if df.empty:
+        return pd.DataFrame(columns=["id", "title", "status", "created_by", "created_at"])
+
+    df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+
+    return df
+
+
+@st.cache_data(ttl=5)
+def load_poll_options(poll_id: int | None = None) -> pd.DataFrame:
+    query = supabase.table("seminar_poll_options").select("*")
+
+    if poll_id is not None:
+        query = query.eq("poll_id", int(poll_id))
+
+    response = (
+        query
+        .order("id", desc=False)
+        .limit(5000)
+        .execute()
+    )
+
+    df = pd.DataFrame(response.data or [])
+
+    if df.empty:
+        return pd.DataFrame(columns=["id", "poll_id", "talk_id", "option_label", "created_at"])
+
+    df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+
+    return df
+
+
+@st.cache_data(ttl=5)
+def load_poll_votes(poll_id: int | None = None) -> pd.DataFrame:
+    query = supabase.table("seminar_poll_votes").select("*")
+
+    if poll_id is not None:
+        query = query.eq("poll_id", int(poll_id))
+
+    response = (
+        query
+        .order("created_at", desc=False)
+        .limit(50000)
+        .execute()
+    )
+
+    df = pd.DataFrame(response.data or [])
+
+    if df.empty:
+        return pd.DataFrame(columns=["id", "poll_id", "option_id", "voter_hash", "created_at"])
+
+    df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+
+    return df
+
+
+def make_voter_hash(user_name: str, poll_id: int) -> str:
+    salt = st.secrets.get("POLL_SALT", st.secrets.get("ADMIN_CODE", "seminar-poll-salt"))
+    raw = f"{salt}|{poll_id}|{user_name}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def create_poll(title: str, options: list[dict], created_by: str):
+    response = supabase.table("seminar_polls").insert(
+        {
+            "title": title.strip(),
+            "status": "open",
+            "created_by": created_by,
+        }
+    ).execute()
+
+    poll_data = response.data or []
+
+    if not poll_data:
+        return
+
+    poll_id = int(poll_data[0]["id"])
+
+    rows = [
+        {
+            "poll_id": poll_id,
+            "talk_id": int(item["talk_id"]),
+            "option_label": item["option_label"],
+        }
+        for item in options
+    ]
+
+    if rows:
+        supabase.table("seminar_poll_options").insert(rows).execute()
+
+    clear_poll_caches()
+
+
+def vote_poll(poll_id: int, option_id: int, user_name: str) -> bool:
+    voter_hash = make_voter_hash(user_name, poll_id)
+
+    try:
+        supabase.table("seminar_poll_votes").insert(
+            {
+                "poll_id": int(poll_id),
+                "option_id": int(option_id),
+                "voter_hash": voter_hash,
+            }
+        ).execute()
+        clear_poll_caches()
+        return True
+    except Exception:
+        return False
+
+
+def update_poll_status(poll_id: int, status: str):
+    supabase.table("seminar_polls").update(
+        {"status": status}
+    ).eq("id", int(poll_id)).execute()
+
+    clear_poll_caches()
+
+
+def render_poll_page(user_name: str):
+    st.header("匿名投票")
+    st.caption("可以勾选某几次主讲，发起一次匿名投票，选出最佳汇报人。结果只显示票数，不显示投票人。")
+
+    polls = load_polls()
+
+    st.subheader("参与投票")
+
+    if polls.empty:
+        st.info("还没有投票。")
+    else:
+        selected_poll_id = st.selectbox(
+            "选择投票",
+            polls["id"].tolist(),
+            format_func=lambda x: f"{polls[polls['id'] == x].iloc[0]['title']}｜{polls[polls['id'] == x].iloc[0]['status']}",
+            key="poll_select",
+        )
+
+        poll = polls[polls["id"] == selected_poll_id].iloc[0].to_dict()
+        options = load_poll_options(int(selected_poll_id))
+        votes = load_poll_votes(int(selected_poll_id))
+
+        if options.empty:
+            st.info("这个投票没有候选项。")
+        else:
+            voter_hash = make_voter_hash(user_name, int(selected_poll_id))
+            has_voted = False
+
+            if not votes.empty:
+                has_voted = voter_hash in votes["voter_hash"].astype(str).tolist()
+
+            if poll["status"] == "open":
+                if has_voted:
+                    st.success("你已经投过票了。")
+                else:
+                    option_id = st.radio(
+                        "选择你认为最好的汇报",
+                        options["id"].tolist(),
+                        format_func=lambda x: options[options["id"] == x].iloc[0]["option_label"],
+                        key=f"poll_vote_radio_{selected_poll_id}",
+                    )
+
+                    if st.button("匿名投票", type="primary", key=f"vote_poll_{selected_poll_id}"):
+                        ok = vote_poll(int(selected_poll_id), int(option_id), user_name)
+
+                        if ok:
+                            st.success("投票成功。")
+                        else:
+                            st.info("你已经投过票了。")
+
+                        st.rerun()
+            else:
+                st.info("这个投票已经关闭。")
+
+            st.subheader("当前结果")
+
+            if votes.empty:
+                result = options[["id", "option_label"]].copy()
+                result["票数"] = 0
+            else:
+                counts = votes.groupby("option_id")["id"].count().reset_index(name="票数")
+                result = options.merge(
+                    counts,
+                    left_on="id",
+                    right_on="option_id",
+                    how="left",
+                ).fillna({"票数": 0})
+                result["票数"] = result["票数"].astype(int)
+
+            result = result[["option_label", "票数"]].rename(columns={"option_label": "候选汇报"})
+            result = result.sort_values("票数", ascending=False)
+
+            st.dataframe(result, use_container_width=True, hide_index=True)
+
+            if st.session_state.get("admin_ok", False):
+                c1, c2 = st.columns(2)
+
+                with c1:
+                    if st.button("开放投票", disabled=poll["status"] == "open", key=f"open_poll_{selected_poll_id}"):
+                        update_poll_status(int(selected_poll_id), "open")
+                        st.rerun()
+
+                with c2:
+                    if st.button("关闭投票", disabled=poll["status"] == "closed", key=f"close_poll_{selected_poll_id}"):
+                        update_poll_status(int(selected_poll_id), "closed")
+                        st.rerun()
+
+    st.divider()
+    st.subheader("创建投票")
+
+    if not st.session_state.get("admin_ok", False):
+        admin_code = st.text_input("管理员口令", type="password", key="poll_admin_code")
+
+        if st.button("进入投票管理", key="poll_admin_login"):
+            expected = st.secrets.get("ADMIN_CODE", "")
+
+            if expected and check_password(admin_code, expected):
+                st.session_state.admin_ok = True
+                st.rerun()
+            else:
+                st.error("管理员口令不对。")
+
+        return
+
+    meetings = load_meetings()
+
+    if meetings.empty:
+        st.info("还没有组会，无法创建投票。")
+        return
+
+    selected_meeting_ids = st.multiselect(
+        "选择候选汇报所在的组会",
+        meetings["id"].tolist(),
+        default=meetings["id"].head(1).tolist(),
+        format_func=lambda x: meeting_display(meetings[meetings["id"] == x].iloc[0]),
+        key="poll_meeting_multiselect",
+    )
+
+    if not selected_meeting_ids:
+        st.info("先选择至少一次组会。")
+        return
+
+    candidate_talks = collect_talks_for_meetings([int(x) for x in selected_meeting_ids])
+
+    if candidate_talks.empty:
+        st.info("所选组会没有汇报模块。")
+        return
+
+    only_main = st.checkbox("只显示主讲 / Journal Club", value=True, key="poll_only_main")
+
+    if only_main:
+        candidate_talks = candidate_talks[candidate_talks["talk_type"] == "main"].copy()
+
+    if candidate_talks.empty:
+        st.info("没有符合条件的主讲。可以取消“只显示主讲 / Journal Club”。")
+        return
+
+    meeting_map = meetings.set_index("id")["meeting_date"].to_dict()
+
+    def poll_talk_label(talk_id):
+        row = candidate_talks[candidate_talks["id"] == talk_id].iloc[0]
+        meeting_date = meeting_map.get(row["meeting_id"], "")
+        speaker = clean_text(row.get("speaker_name"))
+        title = clean_text(row.get("talk_title"))
+        return f"{meeting_date}｜{speaker}｜{title or talk_type_label(row.get('talk_type'))}"
+
+    selected_talk_ids = st.multiselect(
+        "勾选参与投票的主讲",
+        candidate_talks["id"].astype(int).tolist(),
+        format_func=poll_talk_label,
+        key="poll_talk_multiselect",
+    )
+
+    with st.form("create_poll_form"):
+        poll_title = st.text_input(
+            "投票标题",
+            value=f"{get_now_local().date()} 最佳汇报人匿名投票",
+        )
+
+        submitted = st.form_submit_button("创建匿名投票", type="primary")
+
+        if submitted:
+            if not clean_text(poll_title):
+                st.error("投票标题不能为空。")
+            elif not selected_talk_ids:
+                st.error("至少勾选一个主讲。")
+            else:
+                options = [
+                    {
+                        "talk_id": int(talk_id),
+                        "option_label": poll_talk_label(int(talk_id)),
+                    }
+                    for talk_id in selected_talk_ids
+                ]
+
+                create_poll(poll_title, options, user_name)
+                st.success("投票已创建。")
+                st.rerun()
+
 
 
 def render_calendar_page():
@@ -939,20 +1371,103 @@ def render_stats_page():
         st.info("所选月份还没有问题。")
         return
 
-    vote_counts = (
-        votes.groupby("question_id")["id"].count().reset_index(name="获赞数")
-        if not votes.empty
-        else pd.DataFrame(columns=["question_id", "获赞数"])
+    questions["is_featured"] = questions["is_featured"].fillna(False).astype(bool)
+
+    selected_question_ids = questions["id"].astype(int).tolist()
+
+    if votes.empty:
+        selected_votes = pd.DataFrame(columns=["id", "question_id", "voter_name", "reaction_type", "created_at"])
+    else:
+        selected_votes = votes[votes["question_id"].astype(int).isin(selected_question_ids)].copy()
+
+    if not selected_votes.empty:
+        selected_votes["reaction_type"] = selected_votes["reaction_type"].apply(normalize_reaction_type)
+
+    # 每条 vote 归属到被提问者
+    if selected_votes.empty:
+        vote_rows = pd.DataFrame(columns=["question_id", "asker_name", "reaction_type"])
+    else:
+        vote_rows = selected_votes.merge(
+            questions[["id", "asker_name", "meeting_id"]],
+            left_on="question_id",
+            right_on="id",
+            how="left",
+        )
+
+    reaction_columns = list(REACTION_TYPES)
+
+    # 提问数
+    question_counts = (
+        questions.groupby("asker_name", as_index=False)
+        .agg(提问数=("id", "count"))
+        .rename(columns={"asker_name": "姓名"})
     )
 
-    q = questions.merge(
-        vote_counts,
-        left_on="id",
-        right_on="question_id",
-        how="left",
-    ).fillna({"获赞数": 0})
+    # 主讲人赞数：沿用数据库 is_featured 字段
+    speaker_stars = (
+        questions.groupby("asker_name", as_index=False)
+        .agg(主讲人赞数=("is_featured", "sum"))
+        .rename(columns={"asker_name": "姓名"})
+    )
 
-    q["获赞数"] = q["获赞数"].astype(int)
+    # 回复数：answer_text 非空，按 answer_by 统计
+    answered_questions = questions[
+        questions["answer_text"].apply(clean_text).astype(bool)
+        & questions["answer_by"].apply(clean_text).astype(bool)
+    ].copy()
+
+    if answered_questions.empty:
+        answer_counts = pd.DataFrame(columns=["姓名", "回复数"])
+    else:
+        answer_counts = (
+            answered_questions.groupby("answer_by", as_index=False)
+            .agg(回复数=("id", "count"))
+            .rename(columns={"answer_by": "姓名"})
+        )
+
+    # emoji 分项统计
+    if vote_rows.empty:
+        emoji_by_person = pd.DataFrame(columns=["姓名"] + reaction_columns)
+    else:
+        emoji_by_person = (
+            vote_rows
+            .pivot_table(
+                index="asker_name",
+                columns="reaction_type",
+                values="question_id",
+                aggfunc="count",
+                fill_value=0,
+            )
+            .reset_index()
+            .rename(columns={"asker_name": "姓名"})
+        )
+
+    all_names = sorted(
+        set(question_counts["姓名"].astype(str).tolist())
+        | set(speaker_stars["姓名"].astype(str).tolist())
+        | set(answer_counts["姓名"].astype(str).tolist())
+        | (set(emoji_by_person["姓名"].astype(str).tolist()) if not emoji_by_person.empty else set())
+    )
+
+    leaderboard = pd.DataFrame({"姓名": all_names})
+
+    leaderboard = leaderboard.merge(question_counts, on="姓名", how="left")
+    leaderboard = leaderboard.merge(speaker_stars, on="姓名", how="left")
+    leaderboard = leaderboard.merge(answer_counts, on="姓名", how="left")
+    leaderboard = leaderboard.merge(emoji_by_person, on="姓名", how="left")
+
+    for col in ["提问数", "主讲人赞数", "回复数"] + reaction_columns:
+        if col not in leaderboard.columns:
+            leaderboard[col] = 0
+        leaderboard[col] = leaderboard[col].fillna(0).astype(int)
+
+    leaderboard["emoji总反应"] = leaderboard[reaction_columns].sum(axis=1).astype(int)
+    leaderboard["提问大师分"] = (leaderboard["emoji总反应"] + leaderboard["主讲人赞数"]).astype(int)
+
+    leaderboard = leaderboard.sort_values(
+        ["提问大师分", "主讲人赞数", "emoji总反应", "提问数"],
+        ascending=False,
+    )
 
     c1, c2, c3, c4 = st.columns(4)
 
@@ -963,31 +1478,79 @@ def render_stats_page():
         st.metric("组会数", len(selected_meetings))
 
     with c3:
-        st.metric("问题数", len(q))
+        st.metric("问题数", len(questions))
 
     with c4:
-        st.metric("总点赞", int(q["获赞数"].sum()))
+        st.metric("emoji反应", int(leaderboard["emoji总反应"].sum()))
 
     st.caption("当前统计范围：" + "、".join(selected_months))
+    st.caption("提问大师分 = 五类 emoji 反应总数 + 主讲人赞数。暂不加权。")
+
+    def get_winner(df: pd.DataFrame, col: str):
+        if df.empty or col not in df.columns:
+            return "暂无", "0 次"
+
+        max_value = int(df[col].max())
+
+        if max_value <= 0:
+            return "暂无", "0 次"
+
+        winners = df[df[col] == max_value]["姓名"].astype(str).tolist()
+        shown = "、".join(winners[:3])
+
+        if len(winners) > 3:
+            shown += "等"
+
+        return shown, f"{max_value} 次"
+
+    st.subheader("本期称号")
+
+    award_items = [
+        ("📣 问题发动机", "提问数", "提出问题最多，最能把讨论启动起来"),
+        ("🧠 批判性思考者", "🧠批判性思维", "最常被认为问出了批判性问题"),
+        ("💡 创想者", "💡还有这种思路", "最常提出让人眼前一亮的思路"),
+        ("🤝 大众嘴替", "🤝英雄所见略同", "最常问出大家心里也想问的问题"),
+        ("🔍 严谨者", "🔍严谨审视", "最常抓住方法、证据和细节"),
+        ("✨ 启迪者", "✨很有启发", "最常让别人觉得有启发"),
+        ("🌟 主讲赏识奖", "主讲人赞数", "最常被主讲人认可为好问题"),
+        ("💬 有问必答", "回复数", "回复问题最多，最愿意把讨论接住"),
+        ("🏆 提问大师", "提问大师分", "综合表现最高"),
+    ]
+
+    award_cols = st.columns(3)
+
+    for i, (title, col_name, caption) in enumerate(award_items):
+        winner, score = get_winner(leaderboard, col_name)
+
+        with award_cols[i % 3]:
+            st.metric(title, winner, score)
+            st.caption(caption)
 
     st.subheader("提问榜")
 
-    leaderboard = (
-        q.groupby("asker_name", as_index=False)
-        .agg(
-            提问数=("id", "count"),
-            获赞数=("获赞数", "sum"),
-            精选问题数=("is_featured", "sum"),
-        )
-        .rename(columns={"asker_name": "姓名"})
-        .sort_values(["精选问题数", "获赞数", "提问数"], ascending=False)
-    )
+    display_cols = [
+        "姓名",
+        "提问数",
+        "🧠批判性思维",
+        "💡还有这种思路",
+        "🤝英雄所见略同",
+        "🔍严谨审视",
+        "✨很有启发",
+        "emoji总反应",
+        "主讲人赞数",
+        "回复数",
+        "提问大师分",
+    ]
 
-    st.dataframe(leaderboard, use_container_width=True, hide_index=True)
+    st.dataframe(
+        leaderboard[display_cols],
+        use_container_width=True,
+        hide_index=True,
+    )
 
     st.subheader("按月份统计")
 
-    q_with_meeting = q.merge(
+    q_with_meeting = questions.merge(
         meetings[["id", "meeting_date", "month", "title"]],
         left_on="meeting_id",
         right_on="id",
@@ -995,17 +1558,50 @@ def render_stats_page():
         suffixes=("", "_meeting"),
     )
 
-    by_month = (
+    by_month_base = (
         q_with_meeting.groupby("month", as_index=False)
         .agg(
             问题数=("id", "count"),
             提问人数=("asker_name", "nunique"),
-            获赞数=("获赞数", "sum"),
-            精选问题数=("is_featured", "sum"),
+            主讲人赞数=("is_featured", "sum"),
+            回复数=("answer_text", lambda s: s.apply(clean_text).astype(bool).sum()),
         )
         .rename(columns={"month": "月份"})
-        .sort_values("月份", ascending=False)
     )
+
+    if vote_rows.empty:
+        by_month_emoji = pd.DataFrame(columns=["月份"] + reaction_columns)
+    else:
+        vote_with_month = vote_rows.merge(
+            q_with_meeting[["id", "month"]],
+            left_on="question_id",
+            right_on="id",
+            how="left",
+        )
+
+        by_month_emoji = (
+            vote_with_month
+            .pivot_table(
+                index="month",
+                columns="reaction_type",
+                values="question_id",
+                aggfunc="count",
+                fill_value=0,
+            )
+            .reset_index()
+            .rename(columns={"month": "月份"})
+        )
+
+    by_month = by_month_base.merge(by_month_emoji, on="月份", how="left")
+
+    for col in reaction_columns:
+        if col not in by_month.columns:
+            by_month[col] = 0
+        by_month[col] = by_month[col].fillna(0).astype(int)
+
+    by_month["emoji总反应"] = by_month[reaction_columns].sum(axis=1).astype(int)
+    by_month["主讲人赞数"] = by_month["主讲人赞数"].fillna(0).astype(int)
+    by_month = by_month.sort_values("月份", ascending=False)
 
     st.dataframe(by_month, use_container_width=True, hide_index=True)
 
@@ -1032,7 +1628,24 @@ def render_stats_page():
         st.subheader("汇报人 × 提问人矩阵")
         st.dataframe(matrix, use_container_width=True, hide_index=True)
 
-    high = q.merge(
+    st.subheader("问题列表")
+
+    if selected_votes.empty:
+        emoji_by_question = pd.DataFrame(columns=["question_id"] + reaction_columns)
+    else:
+        emoji_by_question = (
+            selected_votes
+            .pivot_table(
+                index="question_id",
+                columns="reaction_type",
+                values="id",
+                aggfunc="count",
+                fill_value=0,
+            )
+            .reset_index()
+        )
+
+    high = questions.merge(
         talks[["id", "speaker_name", "talk_title"]] if not talks.empty else pd.DataFrame(columns=["id", "speaker_name", "talk_title"]),
         left_on="talk_id",
         right_on="id",
@@ -1048,7 +1661,25 @@ def render_stats_page():
         suffixes=("", "_meeting"),
     )
 
-    high = high.sort_values(["is_featured", "获赞数", "created_at"], ascending=[False, False, True]).copy()
+    high = high.merge(
+        emoji_by_question,
+        left_on="id",
+        right_on="question_id",
+        how="left",
+    )
+
+    for col in reaction_columns:
+        if col not in high.columns:
+            high[col] = 0
+        high[col] = high[col].fillna(0).astype(int)
+
+    high["emoji总反应"] = high[reaction_columns].sum(axis=1).astype(int)
+    high["主讲人觉得很赞"] = high["is_featured"].fillna(False).astype(bool)
+
+    high = high.sort_values(
+        ["主讲人觉得很赞", "emoji总反应", "created_at"],
+        ascending=[False, False, True],
+    ).copy()
 
     rows = []
 
@@ -1062,13 +1693,18 @@ def render_stats_page():
                 "上下文": clean_text(row.get("context_label")),
                 "标签": clean_text(row.get("question_tag")),
                 "问题": clean_text(row.get("question_text")),
-                "获赞数": int(row.get("获赞数", 0)),
-                "精选": "是" if bool(row.get("is_featured")) else "",
+                "🧠": int(row.get("🧠批判性思维", 0)),
+                "💡": int(row.get("💡还有这种思路", 0)),
+                "🤝": int(row.get("🤝英雄所见略同", 0)),
+                "🔍": int(row.get("🔍严谨审视", 0)),
+                "✨": int(row.get("✨很有启发", 0)),
+                "emoji总反应": int(row.get("emoji总反应", 0)),
+                "主讲人赞": "是" if bool(row.get("主讲人觉得很赞")) else "",
             }
         )
 
-    st.subheader("问题列表")
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
 
 
 def render_admin_page():
@@ -1226,11 +1862,12 @@ def render_admin_page():
                     key=f"admin_answer_text_{question_id}",
                 )
 
-                featured_input = st.checkbox(
-                    "精选问题",
-                    value=bool(question.get("is_featured")),
-                    key=f"admin_featured_{question_id}",
+                st.caption(
+                    "主讲人赞状态："
+                    + ("主讲人已赞" if bool(question.get("is_featured")) else "主讲人未赞")
+                    + "。这个状态只能由该汇报模块的主讲人在组会现场页操作。"
                 )
+                featured_input = bool(question.get("is_featured"))
 
                 if st.form_submit_button("保存修改", type="primary"):
                     if not clean_text(asker_input):
@@ -1268,8 +1905,8 @@ def render_admin_page():
 
 user_name = render_login()
 
-tab_live, tab_calendar, tab_stats, tab_admin = st.tabs(
-    ["组会现场", "组会日历", "统计评选", "管理员"]
+tab_live, tab_calendar, tab_stats, tab_poll, tab_admin = st.tabs(
+    ["组会现场", "组会日历", "统计评选", "匿名投票", "管理员"]
 )
 
 with tab_live:
@@ -1280,6 +1917,9 @@ with tab_calendar:
 
 with tab_stats:
     render_stats_page()
+
+with tab_poll:
+    render_poll_page(user_name)
 
 with tab_admin:
     render_admin_page()

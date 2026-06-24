@@ -1,7 +1,10 @@
 import calendar
 import hashlib
 import hmac
+import re
+from collections import Counter
 from datetime import datetime
+from html import escape
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -1903,10 +1906,226 @@ def render_admin_page():
                         st.rerun()
 
 
+
+WORD_CLOUD_STOPWORDS = {
+    "这个", "那个", "这些", "那些", "一个", "一些", "一种", "我们", "你们", "他们",
+    "是否", "什么", "为什么", "如何", "怎么", "可以", "可能", "需要", "应该",
+    "因为", "所以", "但是", "如果", "然后", "以及", "或者", "还是", "没有",
+    "进行", "通过", "对于", "关于", "里面", "时候", "比较", "感觉", "觉得",
+    "问题", "提问", "回答", "汇报", "老师", "同学", "实验室",
+    "the", "and", "for", "with", "that", "this", "from", "are", "was", "were",
+}
+
+
+def tokenize_for_wordcloud(text_value: str) -> list[str]:
+    text_value = clean_text(text_value)
+
+    if not text_value:
+        return []
+
+    # 保留中文、英文、数字，其余转为空格
+    text_value = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9_]+", " ", text_value)
+
+    try:
+        import jieba
+        raw_tokens = jieba.lcut(text_value)
+    except Exception:
+        raw_tokens = re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z0-9_]{1,}", text_value)
+
+    tokens = []
+
+    for token in raw_tokens:
+        token = clean_text(token).lower()
+
+        if not token:
+            continue
+
+        if token in WORD_CLOUD_STOPWORDS:
+            continue
+
+        if token.isdigit():
+            continue
+
+        # 中文单字基本没有信息量；英文至少 2 个字符
+        if len(token) < 2:
+            continue
+
+        tokens.append(token)
+
+    return tokens
+
+
+def render_html_wordcloud(counter: Counter, max_words: int = 80):
+    if not counter:
+        st.info("没有足够的文本生成词云。")
+        return
+
+    items = counter.most_common(max_words)
+    max_count = max(count for _, count in items)
+    min_count = min(count for _, count in items)
+
+    spans = []
+
+    for word, count in items:
+        safe_word = escape(str(word))
+        safe_title = escape(f"{word}: {count}")
+
+        if max_count == min_count:
+            size = 24
+        else:
+            size = 14 + (count - min_count) / (max_count - min_count) * 30
+
+        weight = 500 + min(350, count * 35)
+        opacity = 0.58 + min(0.38, count / max_count * 0.38)
+
+        spans.append(
+            f"""
+            <span
+                title="{safe_title}"
+                style="
+                    display:inline-block;
+                    font-size:{size:.1f}px;
+                    font-weight:{weight:.0f};
+                    opacity:{opacity:.2f};
+                    margin:0.28rem 0.42rem;
+                    padding:0.12rem 0.18rem;
+                    line-height:1.22;
+                    color:#1D4ED8;
+                "
+            >{safe_word}</span>
+            """
+        )
+
+    html = f"""
+    <div style="
+        background: linear-gradient(135deg, #FFFFFF 0%, #F4F8FF 100%);
+        border: 1px solid #C8D8F0;
+        border-radius: 1.2rem;
+        padding: 1.1rem 1.2rem;
+        margin: 0.8rem 0 1rem 0;
+        box-shadow: 0 10px 24px rgba(37, 99, 235, 0.07);
+        word-break: keep-all;
+        overflow-wrap: anywhere;
+    ">
+        {"".join(spans)}
+    </div>
+    """
+
+    # 关键：用 st.html 渲染 HTML，不要用 st.markdown，否则某些情况下会直接显示源码
+    if hasattr(st, "html"):
+        st.html(html)
+    else:
+        import streamlit.components.v1 as components
+        components.html(html, height=520, scrolling=True)
+
+
+
+def render_wordcloud_page():
+    st.header("词云")
+    st.caption("从组会问题、回复和汇报主题里提取高频词。词越大，出现越多。")
+
+    meetings = load_meetings()
+
+    if meetings.empty:
+        st.info("暂无组会。")
+        return
+
+    meetings = meetings.copy()
+    meetings["month"] = meetings["meeting_date"].apply(month_label_from_date)
+
+    available_months = sorted(
+        [x for x in meetings["month"].dropna().unique().tolist() if x],
+        reverse=True,
+    )
+
+    if not available_months:
+        st.info("暂无可分析月份。")
+        return
+
+    c1, c2, c3 = st.columns([1.4, 2.2, 1.1])
+
+    with c1:
+        use_all_months = st.checkbox("全部月份", value=False, key="wordcloud_all_months")
+
+    with c2:
+        if use_all_months:
+            selected_months = available_months
+            st.caption("当前：全部月份")
+        else:
+            selected_months = st.multiselect(
+                "选择月份",
+                available_months,
+                default=[available_months[0]],
+                key="wordcloud_months",
+            )
+
+    with c3:
+        max_words = st.slider("词数", min_value=30, max_value=150, value=80, step=10)
+
+    if not selected_months:
+        st.warning("至少选择一个月份。")
+        return
+
+    selected_meetings = meetings[meetings["month"].isin(selected_months)].copy()
+    meeting_ids = selected_meetings["id"].astype(int).tolist()
+
+    if not meeting_ids:
+        st.info("所选月份没有组会。")
+        return
+
+    source = st.radio(
+        "词云来源",
+        ["问题文本", "回复文本", "问题 + 回复", "汇报主题", "全部文本"],
+        horizontal=True,
+        key="wordcloud_source",
+    )
+
+    all_questions = load_questions(None)
+    questions = all_questions[all_questions["meeting_id"].isin(meeting_ids)].copy()
+
+    talks = collect_talks_for_meetings(meeting_ids)
+
+    texts = []
+
+    if source in ["问题文本", "问题 + 回复", "全部文本"]:
+        if not questions.empty:
+            texts.extend(questions["question_text"].apply(clean_text).tolist())
+
+    if source in ["回复文本", "问题 + 回复", "全部文本"]:
+        if not questions.empty and "answer_text" in questions.columns:
+            texts.extend(questions["answer_text"].apply(clean_text).tolist())
+
+    if source in ["汇报主题", "全部文本"]:
+        if not talks.empty:
+            texts.extend(talks["talk_title"].apply(clean_text).tolist())
+
+    tokens = []
+
+    for item in texts:
+        tokens.extend(tokenize_for_wordcloud(item))
+
+    counter = Counter(tokens)
+
+    st.subheader("组会词云")
+    render_html_wordcloud(counter, max_words=max_words)
+
+    st.subheader("高频词表")
+
+    if counter:
+        top_df = pd.DataFrame(
+            counter.most_common(max_words),
+            columns=["词", "出现次数"],
+        )
+        st.dataframe(top_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("暂无高频词。")
+
+
+
 user_name = render_login()
 
-tab_live, tab_calendar, tab_stats, tab_poll, tab_admin = st.tabs(
-    ["组会现场", "组会日历", "统计评选", "匿名投票", "管理员"]
+tab_live, tab_calendar, tab_stats, tab_wordcloud, tab_poll, tab_admin = st.tabs(
+    ["组会现场", "组会日历", "统计评选", "词云", "匿名投票", "管理员"]
 )
 
 with tab_live:
@@ -1917,6 +2136,9 @@ with tab_calendar:
 
 with tab_stats:
     render_stats_page()
+
+with tab_wordcloud:
+    render_wordcloud_page()
 
 with tab_poll:
     render_poll_page(user_name)
